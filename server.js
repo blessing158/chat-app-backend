@@ -37,6 +37,7 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 const auth = admin.auth();
+const FieldValue = admin.firestore.FieldValue;
 
 // Socket.IO
 const io = new Server(server, {
@@ -46,7 +47,7 @@ const io = new Server(server, {
     }
 });
 
-// Verify Firebase ID tokens
+// Authentication middleware
 async function authenticate(req, res, next) {
     try {
         const header = req.headers.authorization || "";
@@ -57,10 +58,11 @@ async function authenticate(req, res, next) {
             });
         }
 
-        const token = header.substring(7);
-        req.user = await auth.verifyIdToken(token);
-        next();
+        req.user = await auth.verifyIdToken(
+            header.substring(7)
+        );
 
+        next();
     } catch (error) {
         return res.status(401).json({
             error: "Invalid or expired authentication token"
@@ -68,12 +70,36 @@ async function authenticate(req, res, next) {
     }
 }
 
+// Check conversation membership
+async function getConversation(conversationId, uid) {
+    const ref = db.collection("conversations")
+        .doc(conversationId);
+
+    const snapshot = await ref.get();
+
+    if (!snapshot.exists) {
+        return null;
+    }
+
+    const conversation = snapshot.data();
+
+    if (!Array.isArray(conversation.members) ||
+        !conversation.members.includes(uid)) {
+        return null;
+    }
+
+    return {
+        ref: ref,
+        data: conversation
+    };
+}
+
 // Home
 app.get("/", (req, res) => {
     res.json({
         name: "Chat App Backend",
         status: "running",
-        version: "2.0.0"
+        version: "3.0.0"
     });
 });
 
@@ -91,9 +117,8 @@ app.get("/api/health", async (req, res) => {
             authentication: "ready",
             messaging: "ready"
         });
-
     } catch (error) {
-        console.error("Firestore health check failed:", error.message);
+        console.error("Health error:", error.message);
 
         res.status(503).json({
             status: "unhealthy",
@@ -103,34 +128,36 @@ app.get("/api/health", async (req, res) => {
     }
 });
 
-// Get the signed-in user's profile
+// Get profile
 app.get("/api/me", authenticate, async (req, res) => {
     try {
-        const userRef = db.collection("users").doc(req.user.uid);
-        const snapshot = await userRef.get();
+        const snapshot = await db.collection("users")
+            .doc(req.user.uid)
+            .get();
 
         res.json({
             uid: req.user.uid,
             email: req.user.email || null,
             profile: snapshot.exists ? snapshot.data() : null
         });
-
     } catch (error) {
         console.error("Profile error:", error.message);
+
         res.status(500).json({
             error: "Could not load profile"
         });
     }
 });
 
-// Create or update the signed-in user's profile
+// Create or update profile
 app.put("/api/me", authenticate, async (req, res) => {
     try {
         const displayName = String(
             req.body.displayName || ""
         ).trim();
 
-        if (displayName.length < 2 || displayName.length > 40) {
+        if (displayName.length < 2 ||
+            displayName.length > 40) {
             return res.status(400).json({
                 error: "Display name must be 2 to 40 characters"
             });
@@ -140,7 +167,7 @@ app.put("/api/me", authenticate, async (req, res) => {
             uid: req.user.uid,
             email: req.user.email || null,
             displayName: displayName,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            updatedAt: FieldValue.serverTimestamp()
         };
 
         await db.collection("users")
@@ -155,14 +182,210 @@ app.put("/api/me", authenticate, async (req, res) => {
                 displayName: profile.displayName
             }
         });
-
     } catch (error) {
         console.error("Profile save error:", error.message);
+
         res.status(500).json({
             error: "Could not save profile"
         });
     }
 });
+
+// Create a private conversation
+app.post("/api/conversations", authenticate, async (req, res) => {
+    try {
+        const otherUid = String(
+            req.body.otherUid || ""
+        ).trim();
+
+        const myUid = req.user.uid;
+
+        if (!otherUid || otherUid === myUid) {
+            return res.status(400).json({
+                error: "A valid other user ID is required"
+            });
+        }
+
+        const otherUser = await auth.getUser(otherUid);
+
+        const members = [myUid, otherUid].sort();
+
+        const existing = await db.collection("conversations")
+            .where("members", "==", members)
+            .limit(1)
+            .get();
+
+        if (!existing.empty) {
+            return res.json({
+                message: "Conversation already exists",
+                conversationId: existing.docs[0].id
+            });
+        }
+
+        const conversation = await db.collection("conversations")
+            .add({
+                members: members,
+                createdAt: FieldValue.serverTimestamp(),
+                updatedAt: FieldValue.serverTimestamp(),
+                lastMessage: null
+            });
+
+        res.status(201).json({
+            message: "Conversation created",
+            conversationId: conversation.id,
+            otherUser: {
+                uid: otherUser.uid,
+                email: otherUser.email || null
+            }
+        });
+    } catch (error) {
+        console.error("Conversation error:", error.message);
+
+        res.status(500).json({
+            error: "Could not create conversation"
+        });
+    }
+});
+
+// List my conversations
+app.get("/api/conversations", authenticate, async (req, res) => {
+    try {
+        const snapshot = await db.collection("conversations")
+            .where("members", "array-contains", req.user.uid)
+            .orderBy("updatedAt", "desc")
+            .limit(50)
+            .get();
+
+        const conversations = snapshot.docs.map(doc => ({
+            id: doc.id,
+            ...doc.data()
+        }));
+
+        res.json({
+            conversations: conversations
+        });
+    } catch (error) {
+        console.error("Conversation list error:", error.message);
+
+        res.status(500).json({
+            error: "Could not load conversations"
+        });
+    }
+});
+
+// Send a message through REST
+app.post(
+    "/api/conversations/:conversationId/messages",
+    authenticate,
+    async (req, res) => {
+        try {
+            const conversationId = req.params.conversationId;
+
+            const content = String(
+                req.body.content || ""
+            ).trim();
+
+            if (!content || content.length > 5000) {
+                return res.status(400).json({
+                    error: "Message must contain 1 to 5000 characters"
+                });
+            }
+
+            const conversation = await getConversation(
+                conversationId,
+                req.user.uid
+            );
+
+            if (!conversation) {
+                return res.status(404).json({
+                    error: "Conversation not found"
+                });
+            }
+
+            const message = {
+                conversationId: conversationId,
+                senderId: req.user.uid,
+                content: content,
+                createdAt: FieldValue.serverTimestamp()
+            };
+
+            const messageRef = await conversation.ref
+                .collection("messages")
+                .add(message);
+
+            await conversation.ref.update({
+                lastMessage: content,
+                updatedAt: FieldValue.serverTimestamp()
+            });
+
+            const responseMessage = {
+                id: messageRef.id,
+                conversationId: conversationId,
+                senderId: req.user.uid,
+                content: content
+            };
+
+            io.to("conversation:" + conversationId)
+                .emit("new_message", responseMessage);
+
+            res.status(201).json({
+                message: "Message sent",
+                data: responseMessage
+            });
+        } catch (error) {
+            console.error("Send message error:", error.message);
+
+            res.status(500).json({
+                error: "Could not send message"
+            });
+        }
+    }
+);
+
+// Load message history
+app.get(
+    "/api/conversations/:conversationId/messages",
+    authenticate,
+    async (req, res) => {
+        try {
+            const conversationId = req.params.conversationId;
+
+            const conversation = await getConversation(
+                conversationId,
+                req.user.uid
+            );
+
+            if (!conversation) {
+                return res.status(404).json({
+                    error: "Conversation not found"
+                });
+            }
+
+            const snapshot = await conversation.ref
+                .collection("messages")
+                .orderBy("createdAt", "desc")
+                .limit(50)
+                .get();
+
+            const messages = snapshot.docs
+                .map(doc => ({
+                    id: doc.id,
+                    ...doc.data()
+                }))
+                .reverse();
+
+            res.json({
+                messages: messages
+            });
+        } catch (error) {
+            console.error("Message history error:", error.message);
+
+            res.status(500).json({
+                error: "Could not load messages"
+            });
+        }
+    }
+);
 
 // Authenticate Socket.IO connections
 io.use(async (socket, next) => {
@@ -176,14 +399,119 @@ io.use(async (socket, next) => {
 
         socket.user = await auth.verifyIdToken(token);
         next();
-
     } catch (error) {
         next(new Error("Invalid authentication token"));
     }
 });
 
+// Real-time messaging
 io.on("connection", (socket) => {
-    console.log("Authenticated user connected:", socket.user.uid);
+    console.log("User connected:", socket.user.uid);
+
+    // Join a conversation
+    socket.on("join_conversation", async (conversationId, callback) => {
+        try {
+            if (typeof conversationId !== "string" ||
+                conversationId.length > 150) {
+                throw new Error("Invalid conversation ID");
+            }
+
+            const conversation = await getConversation(
+                conversationId,
+                socket.user.uid
+            );
+
+            if (!conversation) {
+                throw new Error("Conversation not found");
+            }
+
+            socket.join("conversation:" + conversationId);
+
+            if (typeof callback === "function") {
+                callback({
+                    success: true,
+                    conversationId: conversationId
+                });
+            }
+        } catch (error) {
+            if (typeof callback === "function") {
+                callback({
+                    success: false,
+                    error: error.message
+                });
+            }
+        }
+    });
+
+    // Send real-time message
+    socket.on("send_message", async (data, callback) => {
+        try {
+            const conversationId = data &&
+                data.conversationId;
+
+            const content = String(
+                data && data.content || ""
+            ).trim();
+
+            if (typeof conversationId !== "string" ||
+                conversationId.length > 150) {
+                throw new Error("Invalid conversation ID");
+            }
+
+            if (!content || content.length > 5000) {
+                throw new Error("Invalid message content");
+            }
+
+            const conversation = await getConversation(
+                conversationId,
+                socket.user.uid
+            );
+
+            if (!conversation) {
+                throw new Error("Conversation not found");
+            }
+
+            const message = {
+                conversationId: conversationId,
+                senderId: socket.user.uid,
+                content: content,
+                createdAt: FieldValue.serverTimestamp()
+            };
+
+            const messageRef = await conversation.ref
+                .collection("messages")
+                .add(message);
+
+            await conversation.ref.update({
+                lastMessage: content,
+                updatedAt: FieldValue.serverTimestamp()
+            });
+
+            const responseMessage = {
+                id: messageRef.id,
+                conversationId: conversationId,
+                senderId: socket.user.uid,
+                content: content
+            };
+
+            io.to("conversation:" + conversationId)
+                .emit("new_message", responseMessage);
+
+            if (typeof callback === "function") {
+                callback({
+                    success: true,
+                    message: responseMessage
+                });
+            }
+        } catch (error) {
+            if (typeof callback === "function") {
+                callback({
+                    success: false,
+                    error: error.message
+                });
+            }
+        }
+    });
 
     socket.on("disconnect", () => {
         console.log("User disconnected:", socket.user.uid);
@@ -193,14 +521,17 @@ io.on("connection", (socket) => {
 // Error handler
 app.use((err, req, res, next) => {
     console.error("Server error:", err.message);
+
     res.status(500).json({
         error: "Internal server error"
     });
 });
 
+// Start server
 const PORT = process.env.PORT || 10000;
 
 server.listen(PORT, "0.0.0.0", () => {
-    console.log("Chat backend is running");
+    console.log("Chat backend version 3.0.0 running");
     console.log("Port:", PORT);
 });
+            

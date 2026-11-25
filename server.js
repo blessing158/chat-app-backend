@@ -295,13 +295,12 @@ app.post("/api/conversations", authenticate, async (req, res) => {
     }
 });
 
+
 // List my conversations
 app.get("/api/conversations", authenticate, async (req, res) => {
     try {
         const snapshot = await db.collection("conversations")
             .where("members", "array-contains", req.user.uid)
-            .orderBy("updatedAt", "desc")
-            .limit(50)
             .get();
 
         const conversations = snapshot.docs.map(doc => ({
@@ -309,18 +308,38 @@ app.get("/api/conversations", authenticate, async (req, res) => {
             ...doc.data()
         }));
 
-        res.json({
-            conversations: conversations
+        // Sort conversations by most recently updated
+        conversations.sort((a, b) => {
+            const timeA = a.updatedAt &&
+                a.updatedAt.toMillis
+                ? a.updatedAt.toMillis()
+                : 0;
+
+            const timeB = b.updatedAt &&
+                b.updatedAt.toMillis
+                ? b.updatedAt.toMillis()
+                : 0;
+
+            return timeB - timeA;
         });
+
+        res.json({
+            conversations: conversations.slice(0, 50)
+        });
+
     } catch (error) {
-        console.error("Conversation list error:", error.message);
+        console.error(
+            "Conversation list error:",
+            error.message
+        );
 
         res.status(500).json({
-            error: "Could not load conversations"
+            error: "Could not load conversations",
+            details: error.message
         });
     }
 });
-
+                           
 // Send a message through REST
 app.post(
     "/api/conversations/:conversationId/messages",

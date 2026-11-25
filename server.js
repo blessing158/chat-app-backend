@@ -128,6 +128,7 @@ app.get("/api/health", async (req, res) => {
     }
 });
 
+
 // Get profile
 app.get("/api/me", authenticate, async (req, res) => {
     try {
@@ -140,15 +141,132 @@ app.get("/api/me", authenticate, async (req, res) => {
             email: req.user.email || null,
             profile: snapshot.exists ? snapshot.data() : null
         });
+
     } catch (error) {
         console.error("Profile error:", error.message);
-
         res.status(500).json({
             error: "Could not load profile"
         });
     }
 });
 
+// Create or update profile
+app.put("/api/me", authenticate, async (req, res) => {
+    try {
+        const displayName = String(
+            req.body.displayName || ""
+        ).trim();
+
+        const username = String(
+            req.body.username || ""
+        ).trim().toLowerCase();
+
+        const bio = String(
+            req.body.bio || ""
+        ).trim().slice(0, 160);
+
+        const status = String(
+            req.body.status || ""
+        ).trim().slice(0, 60);
+
+        if (displayName.length < 2 ||
+            displayName.length > 40) {
+            return res.status(400).json({
+                error: "Display name must be 2 to 40 characters"
+            });
+        }
+
+        if (!/^[a-z0-9_]{3,20}$/.test(username)) {
+            return res.status(400).json({
+                error: "Username must be 3-20 characters using letters, numbers or underscores"
+            });
+        }
+
+        const userRef = db.collection("users")
+            .doc(req.user.uid);
+
+        const usernameRef = db.collection("usernames")
+            .doc(username);
+
+        await db.runTransaction(async transaction => {
+
+            const userSnapshot =
+                await transaction.get(userRef);
+
+            const usernameSnapshot =
+                await transaction.get(usernameRef);
+
+            if (usernameSnapshot.exists &&
+                usernameSnapshot.data().uid !== req.user.uid) {
+                const error = new Error(
+                    "That username is already taken"
+                );
+                error.code = "USERNAME_TAKEN";
+                throw error;
+            }
+
+            const oldProfile = userSnapshot.exists
+                ? userSnapshot.data()
+                : {};
+
+            if (oldProfile.username &&
+                oldProfile.username !== username) {
+
+                const oldRef = db.collection("usernames")
+                    .doc(oldProfile.username);
+
+                const oldSnapshot =
+                    await transaction.get(oldRef);
+
+                if (oldSnapshot.exists &&
+                    oldSnapshot.data().uid === req.user.uid) {
+                    transaction.delete(oldRef);
+                }
+            }
+
+            transaction.set(usernameRef, {
+                uid: req.user.uid,
+                username: username
+            });
+
+            transaction.set(userRef, {
+                uid: req.user.uid,
+                email: req.user.email || null,
+                displayName: displayName,
+                username: username,
+                bio: bio,
+                status: status,
+                updatedAt: FieldValue.serverTimestamp()
+            }, { merge: true });
+        });
+
+        res.json({
+            message: "Profile saved successfully",
+            profile: {
+                uid: req.user.uid,
+                displayName: displayName,
+                username: username,
+                bio: bio,
+                status: status
+            }
+        });
+
+    } catch (error) {
+
+        if (error.code === "USERNAME_TAKEN") {
+            return res.status(409).json({
+                error: "That username is already taken"
+            });
+        }
+
+        console.error("Profile save error:", error.message);
+
+        res.status(500).json({
+            error: "Could not save profile"
+        });
+    }
+});
+            
 // Create or update profile
 app.put("/api/me", authenticate, async (req, res) => {
     try {

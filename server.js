@@ -191,6 +191,54 @@ app.put("/api/me", authenticate, async (req, res) => {
     }
 });
 
+// Discover registered DevHub users
+app.get("/api/users", authenticate, async (req, res) => {
+    try {
+        const limit = Math.min(
+            Math.max(parseInt(req.query.limit, 10) || 30, 1),
+            50
+        );
+
+        const pageToken = req.query.pageToken || undefined;
+
+        const result = await auth.listUsers(limit, pageToken);
+
+        const visibleUsers = result.users.filter(
+            user => user.uid !== req.user.uid
+        );
+
+        const users = await Promise.all(
+            visibleUsers.map(async user => {
+                const profileSnapshot = await db.collection("users")
+                    .doc(user.uid)
+                    .get();
+
+                const profile = profileSnapshot.exists
+                    ? profileSnapshot.data()
+                    : {};
+
+                return {
+                    uid: user.uid,
+                    displayName: profile.displayName ||
+                        user.displayName || "DevHub member"
+                };
+            })
+        );
+
+        res.json({
+            users: users,
+            nextPageToken: result.pageToken || null
+        });
+
+    } catch (error) {
+        console.error("User discovery error:", error.message);
+
+        res.status(500).json({
+            error: "Could not load users"
+        });
+    }
+});
+            
 // Create a private conversation
 app.post("/api/conversations", authenticate, async (req, res) => {
     try {

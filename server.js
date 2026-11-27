@@ -11,7 +11,8 @@ const server = http.createServer(app);
 app.use(helmet());
 app.use(express.json({ limit: "1mb" }));
 
-// Firebase configuration
+// FIREBASE CONFIGURATION
+
 const requiredEnv = [
     "FIREBASE_PROJECT_ID",
     "FIREBASE_CLIENT_EMAIL",
@@ -39,7 +40,8 @@ const db = admin.firestore();
 const auth = admin.auth();
 const FieldValue = admin.firestore.FieldValue;
 
-// Socket.IO
+// SOCKET.IO
+
 const io = new Server(server, {
     cors: {
         origin: "*",
@@ -47,7 +49,78 @@ const io = new Server(server, {
     }
 });
 
-// Authentication middleware
+// ONLINE CONNECTION TRACKING
+
+const activeSockets = new Map();
+const presenceWrites = new Map();
+
+function addUserSocket(uid, socketId) {
+    if (!activeSockets.has(uid)) {
+        activeSockets.set(uid, new Set());
+    }
+
+    activeSockets.get(uid).add(socketId);
+}
+
+function removeUserSocket(uid, socketId) {
+    const sockets = activeSockets.get(uid);
+
+    if (!sockets) return false;
+
+    sockets.delete(socketId);
+
+    if (sockets.size === 0) {
+        activeSockets.delete(uid);
+        return true;
+    }
+
+    return false;
+}
+
+function isUserOnline(uid) {
+    const sockets = activeSockets.get(uid);
+    return !!sockets && sockets.size > 0;
+}
+
+function updatePresence(uid) {
+    const previous = presenceWrites.get(uid) ||
+        Promise.resolve();
+
+    const next = previous.catch(function() {
+    }).then(async function() {
+
+        const online = isUserOnline(uid);
+
+        const update = {
+            isOnline: online
+        };
+
+        if (!online) {
+            update.lastSeen = FieldValue.serverTimestamp();
+        }
+
+        await db.collection("users")
+            .doc(uid)
+            .set(update, { merge: true });
+
+        return online;
+    });
+
+    presenceWrites.set(uid, next);
+
+    return next;
+}
+
+function broadcastPresence(uid, online) {
+    io.emit("presence_update", {
+        uid: uid,
+        isOnline: online,
+        lastSeenMillis: online ? null : Date.now()
+    });
+}
+
+// AUTHENTICATION
+
 async function authenticate(req, res, next) {
     try {
         const header = req.headers.authorization || "";
@@ -63,6 +136,7 @@ async function authenticate(req, res, next) {
         );
 
         next();
+
     } catch (error) {
         return res.status(401).json({
             error: "Invalid or expired authentication token"
@@ -70,16 +144,15 @@ async function authenticate(req, res, next) {
     }
 }
 
-// Check conversation membership
+// CONVERSATION MEMBERSHIP
+
 async function getConversation(conversationId, uid) {
     const ref = db.collection("conversations")
         .doc(conversationId);
 
     const snapshot = await ref.get();
 
-    if (!snapshot.exists) {
-        return null;
-    }
+    if (!snapshot.exists) return null;
 
     const conversation = snapshot.data();
 
@@ -94,16 +167,30 @@ async function getConversation(conversationId, uid) {
     };
 }
 
-// Home
+// HELPERS
+
+function getLastSeenMillis(profile) {
+    if (!profile || !profile.lastSeen) return null;
+
+    if (typeof profile.lastSeen.toMillis === "function") {
+        return profile.lastSeen.toMillis();
+    }
+
+    return null;
+}
+
+// HOME
+
 app.get("/", (req, res) => {
     res.json({
-        name: "Chat App Backend",
+        name: "DevHub Backend",
         status: "running",
-        version: "3.0.0"
+        version: "4.0.0"
     });
 });
 
-// Health check
+// HEALTH CHECK
+
 app.get("/api/health", async (req, res) => {
     try {
         await db.collection("_system")
@@ -115,8 +202,11 @@ app.get("/api/health", async (req, res) => {
             server: "online",
             database: "connected",
             authentication: "ready",
-            messaging: "ready"
+            messaging: "ready",
+            presence: "ready",
+            typing: "ready"
         });
+
     } catch (error) {
         console.error("Health error:", error.message);
 
@@ -128,8 +218,8 @@ app.get("/api/health", async (req, res) => {
     }
 });
 
+// GET MY PROFILE
 
-// Get profile
 app.get("/api/me", authenticate, async (req, res) => {
     try {
         const snapshot = await db.collection("users")
@@ -144,13 +234,15 @@ app.get("/api/me", authenticate, async (req, res) => {
 
     } catch (error) {
         console.error("Profile error:", error.message);
+
         res.status(500).json({
             error: "Could not load profile"
         });
     }
 });
 
-// Create or update profile
+// CREATE OR UPDATE PROFILE
+
 app.put("/api/me", authenticate, async (req, res) => {
     try {
         const displayName = String(
@@ -198,9 +290,11 @@ app.put("/api/me", authenticate, async (req, res) => {
 
             if (usernameSnapshot.exists &&
                 usernameSnapshot.data().uid !== req.user.uid) {
+
                 const error = new Error(
                     "That username is already taken"
                 );
+
                 error.code = "USERNAME_TAKEN";
                 throw error;
             }
@@ -266,50 +360,9 @@ app.put("/api/me", authenticate, async (req, res) => {
         });
     }
 });
-            
-// Create or update profile
-app.put("/api/me", authenticate, async (req, res) => {
-    try {
-        const displayName = String(
-            req.body.displayName || ""
-        ).trim();
 
-        if (displayName.length < 2 ||
-            displayName.length > 40) {
-            return res.status(400).json({
-                error: "Display name must be 2 to 40 characters"
-            });
-        }
+// DISCOVER REGISTERED USERS
 
-        const profile = {
-            uid: req.user.uid,
-            email: req.user.email || null,
-            displayName: displayName,
-            updatedAt: FieldValue.serverTimestamp()
-        };
-
-        await db.collection("users")
-            .doc(req.user.uid)
-            .set(profile, { merge: true });
-
-        res.json({
-            message: "Profile saved",
-            profile: {
-                uid: profile.uid,
-                email: profile.email,
-                displayName: profile.displayName
-            }
-        });
-    } catch (error) {
-        console.error("Profile save error:", error.message);
-
-        res.status(500).json({
-            error: "Could not save profile"
-        });
-    }
-});
-
-// Discover registered DevHub users
 app.get("/api/users", authenticate, async (req, res) => {
     try {
         const limit = Math.min(
@@ -327,6 +380,7 @@ app.get("/api/users", authenticate, async (req, res) => {
 
         const users = await Promise.all(
             visibleUsers.map(async user => {
+
                 const profileSnapshot = await db.collection("users")
                     .doc(user.uid)
                     .get();
@@ -338,7 +392,10 @@ app.get("/api/users", authenticate, async (req, res) => {
                 return {
                     uid: user.uid,
                     displayName: profile.displayName ||
-                        user.displayName || "DevHub member"
+                        user.displayName || "DevHub member",
+                    username: profile.username || null,
+                    isOnline: !!profile.isOnline,
+                    lastSeenMillis: getLastSeenMillis(profile)
                 };
             })
         );
@@ -356,8 +413,44 @@ app.get("/api/users", authenticate, async (req, res) => {
         });
     }
 });
-            
-// Create a private conversation
+
+// GET ONE USER'S PRESENCE
+
+app.get("/api/users/:uid/presence", authenticate, async (req, res) => {
+    try {
+        const uid = String(req.params.uid || "");
+
+        if (!uid || uid.length > 128) {
+            return res.status(400).json({
+                error: "Invalid user ID"
+            });
+        }
+
+        const snapshot = await db.collection("users")
+            .doc(uid)
+            .get();
+
+        const profile = snapshot.exists
+            ? snapshot.data()
+            : {};
+
+        res.json({
+            uid: uid,
+            isOnline: !!profile.isOnline,
+            lastSeenMillis: getLastSeenMillis(profile)
+        });
+
+    } catch (error) {
+        console.error("Presence lookup error:", error.message);
+
+        res.status(500).json({
+            error: "Could not load user presence"
+        });
+    }
+});
+
+// CREATE PRIVATE CONVERSATION
+
 app.post("/api/conversations", authenticate, async (req, res) => {
     try {
         const otherUid = String(
@@ -404,6 +497,7 @@ app.post("/api/conversations", authenticate, async (req, res) => {
                 email: otherUser.email || null
             }
         });
+
     } catch (error) {
         console.error("Conversation error:", error.message);
 
@@ -413,8 +507,8 @@ app.post("/api/conversations", authenticate, async (req, res) => {
     }
 });
 
+// LIST MY CONVERSATIONS
 
-// List my conversations
 app.get("/api/conversations", authenticate, async (req, res) => {
     try {
         const snapshot = await db.collection("conversations")
@@ -426,7 +520,6 @@ app.get("/api/conversations", authenticate, async (req, res) => {
             ...doc.data()
         }));
 
-        // Sort conversations by most recently updated
         conversations.sort((a, b) => {
             const timeA = a.updatedAt &&
                 a.updatedAt.toMillis
@@ -446,10 +539,7 @@ app.get("/api/conversations", authenticate, async (req, res) => {
         });
 
     } catch (error) {
-        console.error(
-            "Conversation list error:",
-            error.message
-        );
+        console.error("Conversation list error:", error.message);
 
         res.status(500).json({
             error: "Could not load conversations",
@@ -457,8 +547,10 @@ app.get("/api/conversations", authenticate, async (req, res) => {
         });
     }
 });
-                           
-// Send a message through REST
+
+
+// SEND MESSAGE THROUGH REST
+
 app.post(
     "/api/conversations/:conversationId/messages",
     authenticate,
@@ -517,6 +609,7 @@ app.post(
                 message: "Message sent",
                 data: responseMessage
             });
+
         } catch (error) {
             console.error("Send message error:", error.message);
 
@@ -527,7 +620,8 @@ app.post(
     }
 );
 
-// Load message history
+// LOAD MESSAGE HISTORY
+
 app.get(
     "/api/conversations/:conversationId/messages",
     authenticate,
@@ -562,6 +656,7 @@ app.get(
             res.json({
                 messages: messages
             });
+
         } catch (error) {
             console.error("Message history error:", error.message);
 
@@ -572,7 +667,8 @@ app.get(
     }
 );
 
-// Authenticate Socket.IO connections
+// SOCKET AUTHENTICATION
+
 io.use(async (socket, next) => {
     try {
         const token = socket.handshake.auth &&
@@ -583,17 +679,35 @@ io.use(async (socket, next) => {
         }
 
         socket.user = await auth.verifyIdToken(token);
+
         next();
+
     } catch (error) {
         next(new Error("Invalid authentication token"));
     }
 });
 
-// Real-time messaging
-io.on("connection", (socket) => {
-    console.log("User connected:", socket.user.uid);
+// SOCKET CONNECTION
 
-    // Join a conversation
+io.on("connection", async (socket) => {
+
+    const uid = socket.user.uid;
+
+    console.log("User connected:", uid);
+
+    addUserSocket(uid, socket.id);
+
+    socket.data.joinedConversations = new Set();
+
+    try {
+        const online = await updatePresence(uid);
+        broadcastPresence(uid, online);
+    } catch (error) {
+        console.error("Online status error:", error.message);
+    }
+
+    // JOIN PRIVATE CONVERSATION
+
     socket.on("join_conversation", async (conversationId, callback) => {
         try {
             if (typeof conversationId !== "string" ||
@@ -603,14 +717,18 @@ io.on("connection", (socket) => {
 
             const conversation = await getConversation(
                 conversationId,
-                socket.user.uid
+                uid
             );
 
             if (!conversation) {
                 throw new Error("Conversation not found");
             }
 
-            socket.join("conversation:" + conversationId);
+            const room = "conversation:" + conversationId;
+
+            socket.join(room);
+
+            socket.data.joinedConversations.add(conversationId);
 
             if (typeof callback === "function") {
                 callback({
@@ -618,6 +736,7 @@ io.on("connection", (socket) => {
                     conversationId: conversationId
                 });
             }
+
         } catch (error) {
             if (typeof callback === "function") {
                 callback({
@@ -628,7 +747,8 @@ io.on("connection", (socket) => {
         }
     });
 
-    // Send real-time message
+    // REAL-TIME MESSAGE
+
     socket.on("send_message", async (data, callback) => {
         try {
             const conversationId = data &&
@@ -649,7 +769,7 @@ io.on("connection", (socket) => {
 
             const conversation = await getConversation(
                 conversationId,
-                socket.user.uid
+                uid
             );
 
             if (!conversation) {
@@ -658,7 +778,7 @@ io.on("connection", (socket) => {
 
             const message = {
                 conversationId: conversationId,
-                senderId: socket.user.uid,
+                senderId: uid,
                 content: content,
                 createdAt: FieldValue.serverTimestamp()
             };
@@ -675,7 +795,7 @@ io.on("connection", (socket) => {
             const responseMessage = {
                 id: messageRef.id,
                 conversationId: conversationId,
-                senderId: socket.user.uid,
+                senderId: uid,
                 content: content
             };
 
@@ -688,6 +808,7 @@ io.on("connection", (socket) => {
                     message: responseMessage
                 });
             }
+
         } catch (error) {
             if (typeof callback === "function") {
                 callback({
@@ -698,12 +819,74 @@ io.on("connection", (socket) => {
         }
     });
 
-    socket.on("disconnect", () => {
-        console.log("User disconnected:", socket.user.uid);
+    // TYPING INDICATOR
+
+    socket.on("typing", async (data) => {
+        try {
+            const conversationId = data &&
+                data.conversationId;
+
+            const isTyping = !!(data && data.isTyping);
+
+            if (typeof conversationId !== "string" ||
+                conversationId.length > 150) {
+                return;
+            }
+
+            if (!socket.data.joinedConversations ||
+                !socket.data.joinedConversations.has(conversationId)) {
+                return;
+            }
+
+            socket.to("conversation:" + conversationId)
+                .emit("user_typing", {
+                    conversationId: conversationId,
+                    uid: uid,
+                    isTyping: isTyping
+                });
+
+        } catch (error) {
+            console.error("Typing event error:", error.message);
+        }
+    });
+
+    // PRESENCE HEARTBEAT
+
+    socket.on("presence_heartbeat", function() {
+        socket.emit("presence_heartbeat_ack", {
+            success: true
+        });
+    });
+
+    // DISCONNECT
+
+    socket.on("disconnect", async () => {
+
+        console.log("User disconnected:", uid);
+
+        const lastConnection = removeUserSocket(
+            uid,
+            socket.id
+        );
+
+        if (lastConnection) {
+            try {
+                const online = await updatePresence(uid);
+
+                broadcastPresence(uid, online);
+
+            } catch (error) {
+                console.error(
+                    "Offline status error:",
+                    error.message
+                );
+            }
+        }
     });
 });
 
-// Error handler
+// ERROR HANDLER
+
 app.use((err, req, res, next) => {
     console.error("Server error:", err.message);
 
@@ -712,11 +895,12 @@ app.use((err, req, res, next) => {
     });
 });
 
-// Start server
+// START SERVER
+
 const PORT = process.env.PORT || 10000;
 
 server.listen(PORT, "0.0.0.0", () => {
-    console.log("Chat backend version 3.0.0 running");
+    console.log("DevHub backend version 4.0.0 running");
     console.log("Port:", PORT);
 });
-            
+    
